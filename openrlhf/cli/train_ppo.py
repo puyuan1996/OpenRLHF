@@ -287,6 +287,9 @@ def train(args):
 
 
 if __name__ == "__main__":
+    import os
+    os.environ["MASTER_PORT"] = "29505" # TODO
+
     parser = argparse.ArgumentParser()
     # Checkpoint
     parser.add_argument("--save_path", type=str, default="./ckpt")
@@ -427,6 +430,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_ms", action="store_true", default=False)
 
     args = parser.parse_args()
+    args.vllm_enable_sleep = False
 
     if args.advantage_estimator not in ["gae"]:
         args.critic_pretrain = None
