@@ -191,7 +191,7 @@ class NaiveExperienceMaker(ABC):
 
     @torch.no_grad()
     def make_experience_list(
-        self, all_prompts: Union[str, List[str]], all_labels, **generate_kwargs
+        self, all_prompts: Union[str, List[str]], backend: str = "vllm", **generate_kwargs
     ) -> List[Experience]:
         """
         Make a list of experience with the micro_rollout_batch_size.
@@ -211,26 +211,7 @@ class NaiveExperienceMaker(ABC):
             torch.cuda.synchronize()
 
         # generate responses
-        if self.strategy.ring_attn_group is not None:
-            # Only rank 0 in the ring attention group executes the generation function, and then broadcasts it to all other ranks.
-            if self.strategy.ring_attn_rank == 0:
-                samples_list = self.generate_samples(all_prompts, all_labels, **generate_kwargs)
-                dist.broadcast_object_list(samples_list, src=dist.get_rank(), group=self.strategy.ring_attn_group)
-            else:
-                world_size = torch.distributed.get_world_size() // args.ring_attn_size
-                samples_list = [None] * (
-                    args.rollout_batch_size * args.n_samples_per_prompt // world_size // args.micro_rollout_batch_size
-                )
-                dist.broadcast_object_list(
-                    samples_list, src=self.strategy.ring_attn_ranks[0], group=self.strategy.ring_attn_group
-                )
-        else:
-            samples_list = self.generate_samples(all_prompts, all_labels, **generate_kwargs)
-
-        # vLLM offload when vllm_enable_sleep
-        if self.strategy.args.vllm_enable_sleep:
-            batch_vllm_engine_call(self.vllm_engines, "sleep")
-
+        samples_list = self.generate_samples(all_prompts, backend, **generate_kwargs)
         torch.distributed.barrier()
         torch.cuda.synchronize()
 
@@ -291,7 +272,7 @@ class NaiveExperienceMaker(ABC):
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[str], backend: str, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
         """
@@ -546,9 +527,9 @@ class NaiveExperienceMaker(ABC):
 
 
 class RemoteExperienceMaker(NaiveExperienceMaker):
-    def __init__(self, *args, vllm_engines: List = None, packing_samples=False, **kwargs):
+    def __init__(self, *args, inference_engines: List = None, packing_samples=False, **kwargs):
         super().__init__(*args, **kwargs)
-        self.vllm_engines = vllm_engines
+        self.inference_engines = inference_engines
         self.packing_samples = packing_samples
 
         if self.custom_reward_func:
@@ -574,19 +555,17 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[str], backend, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
 
         When not using vllm, we will fallback to the default implementation,
         in which actor will be used to generate samples.
         """
-        if self.vllm_engines is None:
-            return super().generate_samples(all_prompts, all_labels, **generate_kwargs)
+        if self.inference_engines is None:
+            return super().generate_samples(all_prompts, backend, **generate_kwargs)
 
-        # vLLM generation
-        samples = self._generate_vllm(all_prompts, all_labels, **generate_kwargs)
-        return samples
+        return self.sampling(all_prompts, backend, **generate_kwargs)
 
     @torch.no_grad()
     def make_experience(self, samples: Samples) -> Experience:
@@ -770,61 +749,83 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         self.actor.train()  # reset model state
         return experience
 
-    def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> List[Samples]:
-        from vllm import SamplingParams
+    def sampling(self, all_prompts: List[str], backend, **kwargs) -> List[Samples]:
 
         # round-robin load balance
         rank = torch.distributed.get_rank() // self.strategy.ring_attn_size
         world_size = torch.distributed.get_world_size() // self.strategy.ring_attn_size
 
         # Select LLM engines: assign each rank an engine, or cycle through engines if world_size < engine_count
-        if len(self.vllm_engines) <= world_size:
-            llms = [self.vllm_engines[rank % len(self.vllm_engines)]]
+        if len(self.inference_engines) <= world_size:
+            llms = [self.inference_engines[rank % len(self.inference_engines)]]
         else:
-            llms = self.vllm_engines[rank::world_size]
+            llms = self.inference_engines[rank::world_size]
 
         args = self.strategy.args
 
-        sampling_params = SamplingParams(
-            temperature=kwargs.get("temperature", 1.0),
-            top_p=kwargs.get("top_p", 1.0),
-            top_k=kwargs.get("top_k", -1),
-            max_tokens=kwargs.get("max_new_tokens", 1024),
-            min_tokens=kwargs.get("min_new_tokens", 1),
-            skip_special_tokens=kwargs.get("skip_special_tokens", False),
-            include_stop_str_in_output=True,
-        )
+        sampling_params = {
+            "temperature": kwargs.get("temperature", 1.0),
+            "top_p": kwargs.get("top_p", 1.0),
+            "top_k": kwargs.get("top_k", -1),
+            "max_tokens": kwargs.get("max_new_tokens", 1024),
+            "min_tokens": kwargs.get("min_new_tokens", 1),
+            "skip_special_tokens": kwargs.get("skip_special_tokens", False),
+            "include_stop_str_in_output": True,
+        }
 
         # Expand prompt list based on the number of samples per prompt
         all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
-        all_labels = sum([[label] * args.n_samples_per_prompt for label in all_labels], [])
-        all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
+        all_input_token_id_list = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
 
         # Distribute requests to engines and collect responses to outputs
-        refs = []
-        batch_size = (len(all_prompt_token_ids) + len(llms) - 1) // len(llms)
-        for i, llm in enumerate(llms):
-            prompt_token_ids = all_prompt_token_ids[i * batch_size : (i + 1) * batch_size]
-            refs.append(
-                llm.add_requests.remote(rank, sampling_params=sampling_params, prompt_token_ids=prompt_token_ids)
-            )
-        ray.get(refs)
+        all_output_refs = []
+        batch_size = (len(all_input_token_id_list) + len(llms) - 1) // len(llms)
+        pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
 
-        # Make sure all requests are sent.
-        if self.strategy.ring_attn_group is None:
-            torch.distributed.barrier()
+        for i, llm in enumerate(llms):
+            prompt_token_ids = all_input_token_id_list[i * batch_size : (i + 1) * batch_size]
+            if prompt_token_ids:
+                all_output_refs.append(
+                    llm.generate.remote(
+                        sampling_params=sampling_params,
+                        prompt_token_ids=prompt_token_ids,
+                        stop_token_ids=[eos_token_id],
+                    )
+                )
 
         # Retrieve and combine results from all outputs
         all_output_refs = []
         for i, llm in enumerate(llms):
             all_output_refs.append(llm.get_responses.remote(rank))
         all_outputs = sum(ray.get(all_output_refs), [])
+        assert len(all_outputs) == len(all_prompts) and len(all_outputs) == len(all_input_token_id_list)
 
+        if backend == "sglang":
+            # sglang
+            all_output_token_id_list = [
+                (
+                    list(output["token_ids"]) + [eos_token_id]
+                    if list(output["token_ids"])[-1] != eos_token_id
+                    else list(output["token_ids"])
+                )
+                for output in all_outputs
+            ]
+        elif backend == "vllm":
+            # vllm
+            all_output_token_id_list = [list(output.outputs[0].token_ids) for output in all_outputs]
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
         samples_list = []
+
         for i in range(0, len(all_outputs), args.micro_rollout_batch_size):
-            outputs = all_outputs[i : i + self.strategy.args.micro_rollout_batch_size]
-            prompts = all_prompts[i : i + self.strategy.args.micro_rollout_batch_size]
-            labels = all_labels[i : i + self.strategy.args.micro_rollout_batch_size]
+            input_token_id_list = all_input_token_id_list[i : i + self.strategy.args.micro_rollout_batch_size]
+            output_token_id_list = all_output_token_id_list[i : i + self.strategy.args.micro_rollout_batch_size]
+            output_token_id_list = [
+                output_token_id if output_token_id[-1] == eos_token_id else output_token_id + [eos_token_id]
+                for output_token_id in output_token_id_list
+            ]
+            assert all(output_token_id[-1] == eos_token_id for output_token_id in output_token_id_list)
+
             if not self.packing_samples:
                 # NOTE: concat all outputs to following format:
                 #
@@ -832,21 +833,19 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 # | token token token token token | token token [EOS] [PAD] |
                 # | [PAD] [PAD] [PAD] token token | token token token [EOS] |
                 # |<---------- prompt ----------->|<-------- answer ------->|
-                max_input_len, max_output_len = 0, 0
-                for output in outputs:
-                    max_input_len = max(max_input_len, len(output.prompt_token_ids))
-                    max_output_len = max(max_output_len, len(output.outputs[0].token_ids))
 
-                pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
+                max_input_len = max(len(input_id) for input_id in input_token_id_list)
+                max_output_len = max(len(output_id) for output_id in output_token_id_list)
+
                 sequences = []
-                for output in outputs:
+                for input_token_id, output_token_id in zip(input_token_id_list, output_token_id_list):
                     # left padding input
-                    input_len = len(output.prompt_token_ids)
-                    input_ids = [pad_token_id] * (max_input_len - input_len) + list(output.prompt_token_ids)
+                    input_len = len(input_token_id)
+                    input_ids = [pad_token_id] * (max_input_len - input_len) + input_token_id
 
                     # right padding output
-                    output_len = len(output.outputs[0].token_ids)
-                    output_ids = list(output.outputs[0].token_ids) + [pad_token_id] * (max_output_len - output_len)
+                    output_len = len(output_token_id)
+                    output_ids = output_token_id + [pad_token_id] * (max_output_len - output_len)
 
                     # concat input and output
                     sequences.append(input_ids + output_ids)
@@ -877,16 +876,17 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 #
                 # | token token token | token token [EOS] | token token token token token | token token [EOS] | token token | token token token [EOS] |
                 # |<---  prompt ----->|<---- answer ----->|<---------- prompt ----------->|<----- answer ---->|<- prompt -->|<-------- answer ------->|
-                pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
+
                 sequences = []
                 packed_seq_lens = []
                 attention_mask = []
                 num_actions = []
-                for i, output in enumerate(outputs):
-                    input_len = len(output.prompt_token_ids)
-                    output_len = len(output.outputs[0].token_ids)
+
+                for i, (input_token_id, output_token_id) in enumerate(zip(input_token_id_list, output_token_id_list)):
+                    input_len = len(input_token_id)
+                    output_len = len(output_token_id)
                     packed_seq_lens.append(input_len + output_len)
-                    sequences.extend(output.prompt_token_ids + list(output.outputs[0].token_ids))
+                    sequences.extend(input_token_id + output_token_id)
                     attention_mask.extend([i + 1] * (input_len + output_len))
 
                     # current_action_mask = [0] * (input_len - 1) + [1] * output_len + [0]

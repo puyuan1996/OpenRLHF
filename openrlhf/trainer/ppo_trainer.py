@@ -90,6 +90,7 @@ class PPOTrainer(ABC):
         reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
         save_hf_ckpt: bool = False,
         disable_ds_ckpt: bool = False,
+        backend: str = "vllm",
         **generate_kwargs,
     ) -> None:
         assert (
@@ -97,6 +98,7 @@ class PPOTrainer(ABC):
         ), "reward_fn must be specified if using multiple reward models"
 
         super().__init__()
+        self.backend = backend
         self.strategy = strategy
         self.args = strategy.args
         self.save_hf_ckpt = save_hf_ckpt
@@ -203,16 +205,13 @@ class PPOTrainer(ABC):
             // args.rollout_batch_size
             // args.n_samples_per_prompt
         )
-
         # get eval and save steps
         if args.eval_steps == -1:
             args.eval_steps = num_rollouts_per_episodes  # Evaluate once per epoch
         if args.save_steps == -1:
             args.save_steps = float("inf")  # do not save ckpt
-
         self.prompts_dataloader = prompts_dataloader
         self.pretrain_dataloader = pretrain_dataloader
-
         # Restore step and start_epoch
         steps = consumed_samples // args.rollout_batch_size + 1
         start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
@@ -231,13 +230,14 @@ class PPOTrainer(ABC):
 
             for rand_prompts, labels in self.prompts_dataloader:
                 for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(rand_prompts, labels, **self.generate_kwargs)
+                    self.experience_maker.make_experience_list(rand_prompts, self.backend, **self.generate_kwargs)
                 ):
                     if i == 0:
                         output = self.tokenizer.batch_decode(
                             experience.sequences[0].unsqueeze(0), skip_special_tokens=True
                         )
                         self.strategy.print(output)
+
                     self.replay_buffer.append(experience)
 
                 if self.args.advantage_estimator != "group_norm":
@@ -285,7 +285,6 @@ class PPOTrainer(ABC):
             for experience in pbar:
                 experience.to_device(device)
                 status = self.training_step(experience, global_steps)
-
                 # for DP
                 # weighted mean for kl
                 if "kl" in status:
@@ -305,7 +304,6 @@ class PPOTrainer(ABC):
                         "kl": status["kl"],
                         "act_lr": status["actor_lr"],
                     }
-
                 if "critic_loss" in status:
                     short_status["cri"] = status["critic_loss"]
                     short_status["vals"] = status["values"]
@@ -313,7 +311,6 @@ class PPOTrainer(ABC):
 
                 if "ptx_loss" in status:
                     short_status["ptx"] = status["ptx_loss"]
-
                 status_list.append(status)
                 pbar.set_postfix(short_status)
 
@@ -337,7 +334,6 @@ class PPOTrainer(ABC):
 
     def training_step_actor(self, experience: Experience) -> Dict[str, float]:
         self.actor.train()
-
         # TODO: this is a bad indicator to say that data is packed...
         if isinstance(experience.sequences, list):
             sequences = torch.cat(experience.sequences, dim=0).unsqueeze(0)
@@ -443,7 +439,6 @@ class PPOTrainer(ABC):
                 inputs,
                 self.ptx_loss_fn.IGNORE_INDEX,
             )
-
             output = self.actor(inputs, attention_mask=attention_mask, return_output=True)
             ptx_log_probs = output["logits"]
 
@@ -476,7 +471,6 @@ class PPOTrainer(ABC):
 
     def training_step_critic(self, experience: Experience) -> Dict[str, float]:
         self.critic.train()
-
         # TODO: this is a bad indicator to say that data is packed...
         if isinstance(experience.sequences, list):
             sequences = torch.cat(experience.sequences, dim=0).unsqueeze(0)
