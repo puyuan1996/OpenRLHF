@@ -41,17 +41,7 @@ class WorkerWrap(Worker):
             print(f"update weight: {name}, dtype: {dtype}, shape: {shape}")
         assert dtype == self.model_config.dtype, f"mismatch dtype: src {dtype}, dst {self.model_config.dtype}"
         weight = torch.empty(shape, dtype=dtype, device="cuda")
-<<<<<<< HEAD
-        if self._model_update_with_ray:
-            import ray.util.collective as collective
-
-            collective.broadcast(weight, 0, group_name=self._model_update_group)
-        else:
-            torch.distributed.broadcast(weight, 0, group=self._model_update_group)
-
-=======
         torch.distributed.broadcast(weight, 0, group=self._model_update_group)
->>>>>>> 06ce7866d66799af8bab597df52b00f4fa577aee
         self.model_runner.model.load_weights(weights=[(name, weight)])
 
         del weight

@@ -18,6 +18,9 @@ def train(args):
     strategy = get_strategy(args)
     strategy.setup_distributed()
 
+    # if strategy.is_rank_0():
+    #     import ipdb; ipdb.set_trace()
+    
     # configure model
     # load huggingface model
     actor = Actor(
@@ -434,8 +437,9 @@ if __name__ == "__main__":
     # ModelScope parameters
     parser.add_argument("--use_ms", action="store_true", default=False)
 
+    parser.add_argument("--vllm_enable_sleep", action="store_true", default=False)
+
     args = parser.parse_args()
-    args.vllm_enable_sleep = False
 
     if args.advantage_estimator not in ["gae"]:
         args.critic_pretrain = None

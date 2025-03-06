@@ -16,12 +16,6 @@ from openrlhf.models.utils import compute_approx_kl, compute_reward, masked_mean
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.remote_rm_utils import remote_rm_fn, remote_rm_fn_ray
 
-import torch
-import torch.nn as nn
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Optional, Union, Tuple
-
 logger = init_logger(__name__)
 
 
@@ -131,180 +125,6 @@ class Samples:
     pad_len: Optional[int]
 
 
-###############################################################################
-# 先设计生成后端的抽象接口
-###############################################################################
-class BaseGenerationBackend(ABC):
-    @abstractmethod
-    def generate(
-        self, prompts: List[str], labels: List[str], generate_kwargs: dict
-    ) -> List[Samples]:
-        """
-        使用后端生成回复并返回 Samples 列表。
-
-        参数：
-           prompts: prompt 字符串列表
-           labels: 每个 prompt 对应的期望标签（可用于后续奖励计算等）
-           generate_kwargs: 调用生成时的参数
-        返回：
-           List[Samples]
-        """
-        pass
-
-
-###############################################################################
-# vllm 后端实现（仅为示例，实际根据 vllm 接口细节调整）
-###############################################################################
-class VLLMBackend(BaseGenerationBackend):
-    def __init__(self, model_name: str, tokenizer, prompt_max_len: int = 1024, tensor_parallel_size=1, **kwargs):
-        """
-        model_name: vllm 模型名或路径
-        tokenizer: 用于 tokenization 的对象（要求有类似 Hugging Face tokenizer 的接口）
-        prompt_max_len: prompt 的最大长度
-        kwargs: 其他传给 vllm.LLM 的参数
-        """
-        from vllm import LLM  # 注意确保 vllm 已安装
-        # print(f"kwargs:{kwargs}")
-        # print(f"kwargs:{kwargs}")
-        print(f"tensor_parallel_size:{tensor_parallel_size}")
-        self.llm = LLM(model=model_name, task="generate", tensor_parallel_size=tensor_parallel_size, **kwargs)
-        # tensor_parallel_size=8,  # 设置为8
-        # pipeline_model_parallel_size=1,
-        self.tokenizer = tokenizer
-        self.prompt_max_len = prompt_max_len
-
-    @torch.no_grad()
-    def generate(
-        self, prompts: List[str], labels: List[str], generate_kwargs: dict = {}
-    ) -> List[Samples]:
-        # 调用 vllm 接口生成回复（这里假设 vllm.LLM.generate 支持列表输入）
-        outputs = self.llm.generate(prompts, **generate_kwargs)
-        # 假设 outputs 返回的是一个列表，每个元素包含生成的 token_ids 信息
-        samples_list = []
-        pad_token_id = self.tokenizer.pad_token_id if hasattr(self.tokenizer, "pad_token_id") else 0
-        eos_token_id = self.tokenizer.eos_token_id if hasattr(self.tokenizer, "eos_token_id") else 1
-
-        for prompt, label, output in zip(prompts, labels, outputs):
-            # 拼接 prompt 与生成回复（这里简单拼接，实际可依据生成情况调整）
-            # if self.strategy.is_rank_0():
-            # import ipdb; ipdb.set_trace()
-            # prompt_token_ids = list(output.prompt_token_ids)
-            print(f"len(list(output.prompt_token_ids)): {len(output.prompt_token_ids)}")
-            output_token_ids = list(output.outputs[0].token_ids)
-            # print(output.outputs[0].text)
-
-            # 确保回复以 eos 结束
-            if output_token_ids[-1] != eos_token_id:
-                output_token_ids.append(eos_token_id)
-            prompt_ids = self.tokenizer(
-                prompt, add_special_tokens=False, max_length=self.prompt_max_len, truncation=True
-            )["input_ids"]
-            all_ids = prompt_ids + output_token_ids
-
-            # 生成 tensor 并构造 attention_mask。注意这里简单地认为左侧填充（可以进一步改进）
-            sequences = torch.tensor([all_ids])
-            # attention_mask = (sequences != pad_token_id).long()
-            attention_mask = (sequences != pad_token_id).float()
-            # 假设回复部分对应 action_mask 的 1 标记，从 prompt 长度开始
-            action_mask = torch.zeros_like(sequences, dtype=torch.bool)
-            action_mask[:, len(prompt_ids):] = 1
-
-            sequences = sequences.to("cuda")
-            attention_mask = attention_mask.to("cuda")
-            action_mask = action_mask.to("cuda")
-
-            samples = Samples(
-                sequences=sequences,
-                attention_mask=attention_mask,
-                action_mask=action_mask[:,1:].float(), # TODO
-                # action_mask=action_mask,
-                num_actions=action_mask.size(1),
-                packed_seq_lens=None,
-                response_length=torch.tensor([action_mask.float().sum().item()]),
-                total_length=torch.tensor([attention_mask.float().sum().item()]),
-                prompts=[prompt],
-                labels=[label],
-                pad_len=None,
-            )
-            samples_list.append(samples)
-        return samples_list
-
-
-###############################################################################
-# sglang 后端实现（仅为示例，具体依据 sglang 接口调整）
-###############################################################################
-class SGLangBackend(BaseGenerationBackend):
-    def __init__(self, model_path: str, tokenizer, prompt_max_len: int = 1024, **kwargs):
-        """
-        model_path: sglang 模型路径
-        tokenizer: 用于 tokenization 的对象
-        prompt_max_len: prompt 的最大长度
-        kwargs: 其他传递给 sglang.Engine 的参数（可参考 sglang 的初始化参数）
-        """
-        import sglang
-        self.llm = sglang.Engine(
-            model_path=model_path,
-            trust_remote_code=kwargs.get("trust_remote_code", True),
-            dtype=kwargs.get("dtype", "auto"),
-            tp_size=kwargs.get("tensor_parallel_size", 1),
-            device="cuda",
-            random_seed=kwargs.get("seed", 42),
-            # 其他 sglang 参数……
-        )
-        self.tokenizer = tokenizer
-        self.prompt_max_len = prompt_max_len
-
-    def generate(
-        self, prompts: List[str], labels: List[str], generate_kwargs: dict
-    ) -> List[Samples]:
-        # 调用 sglang 的 generate 接口（注意 sglang 的参数命名可能与 vllm 不同）
-        # 此处将 generate_kwargs 转换为 sglang 所需的参数结构
-        sampling_params = {
-            "max_new_tokens": generate_kwargs.get("max_new_tokens", 1024),
-            "top_p": generate_kwargs.get("top_p", 1.0),
-            "top_k": generate_kwargs.get("top_k", 50),
-            "temperature": generate_kwargs.get("temperature", 1.0),
-            "repetition_penalty": generate_kwargs.get("repetition_penalty", 1.0),
-            "skip_special_tokens": generate_kwargs.get("skip_special_tokens", False),
-            "stop_token_ids": generate_kwargs.get("stop_token_ids", []),
-        }
-        outputs = self.llm.generate(prompts, sampling_params)
-        samples_list = []
-        pad_token_id = self.tokenizer.pad_token_id if hasattr(self.tokenizer, "pad_token_id") else 0
-        eos_token_id = self.tokenizer.eos_token_id if hasattr(self.tokenizer, "eos_token_id") else 1
-
-        for prompt, label, output in zip(prompts, labels, outputs):
-            # 假设 output 为 dict，包含生成文本 string
-            generated_text = output["text"]
-            # 根据生成文本对 prompt 再次 tokenize（也可直接依据 sglang 返回的 token_ids 调整）
-            full_text = prompt + generated_text
-            tokenized = self.tokenizer(
-                full_text, add_special_tokens=False, max_length=self.prompt_max_len, truncation=True, return_tensors="pt"
-            )
-            seq_tensor = tokenized["input_ids"]
-            attn_mask = tokenized["attention_mask"]
-            action_mask = torch.zeros_like(seq_tensor, dtype=torch.bool)
-            prompt_ids = self.tokenizer(
-                prompt, add_special_tokens=False, max_length=self.prompt_max_len, truncation=True, return_tensors="pt"
-            )["input_ids"]
-            action_mask[:, prompt_ids.size(1):] = 1
-
-            samples = Samples(
-                sequences=seq_tensor,
-                attention_mask=attn_mask,
-                action_mask=action_mask,
-                num_actions=action_mask.size(1),
-                packed_seq_lens=None,
-                response_length=torch.tensor([action_mask.sum().item()]),
-                total_length=torch.tensor([attn_mask.sum().item()]),
-                prompts=[prompt],
-                labels=[label],
-                pad_len=None,
-            )
-            samples_list.append(samples)
-        return samples_list
-    
-
 class NaiveExperienceMaker(ABC):
     """
     Naive experience maker.
@@ -322,8 +142,6 @@ class NaiveExperienceMaker(ABC):
         strategy=None,
         remote_rm_url: Union[list[str], str] = None,
         reward_fn=None,
-        # 新增 generation_backend 参数，若不为空则使用该后端生成样本
-        generation_backend: Optional[BaseGenerationBackend] = None,
     ) -> None:
         super().__init__()
         self.actor = actor
@@ -338,8 +156,6 @@ class NaiveExperienceMaker(ABC):
         self.reward_fn = reward_fn
         self.perf_stats = None
         self.advantage_estimator = strategy.args.advantage_estimator
-
-        self.generation_backend = generation_backend
 
         # custom reward func for reinforced finetuning
         self.custom_reward_func = None
@@ -487,35 +303,26 @@ class NaiveExperienceMaker(ABC):
         # sample multiple response
         all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
         all_labels = sum([[label] * args.n_samples_per_prompt for label in all_labels], [])
-
-        if self.generation_backend is not None:
-            if self.strategy.is_rank_0():
-                import ipdb; ipdb.set_trace()
-            # return self.generation_backend.generate(all_prompts, all_labels, generate_kwargs)
-            return self.generation_backend.generate(all_prompts, all_labels)
-        else:
-            # 默认走 self.actor.generate（例如基于 transformers 的生成接口）
-
-            samples_list = []
-            for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
-                prompts = all_prompts[i : i + args.micro_rollout_batch_size]
-                labels = all_labels[i : i + args.micro_rollout_batch_size]
-                inputs = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
-                sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
-                samples = Samples(
-                    sequences=sequences,
-                    attention_mask=attention_mask,
-                    action_mask=action_mask,
-                    num_actions=action_mask.size(1),
-                    packed_seq_lens=None,
-                    response_length=action_mask.float().sum(dim=-1),
-                    total_length=attention_mask.float().sum(dim=-1),
-                    prompts=prompts,
-                    labels=labels,
-                    pad_len=None,
-                )
-                samples_list.append(samples)
-            return samples_list
+        samples_list = []
+        for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
+            prompts = all_prompts[i : i + args.micro_rollout_batch_size]
+            labels = all_labels[i : i + args.micro_rollout_batch_size]
+            inputs = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
+            sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
+            samples = Samples(
+                sequences=sequences,
+                attention_mask=attention_mask,
+                action_mask=action_mask,
+                num_actions=action_mask.size(1),
+                packed_seq_lens=None,
+                response_length=action_mask.float().sum(dim=-1),
+                total_length=attention_mask.float().sum(dim=-1),
+                prompts=prompts,
+                labels=labels,
+                pad_len=None,
+            )
+            samples_list.append(samples)
+        return samples_list
 
     @torch.no_grad()
     def make_experience(self, samples: Samples) -> Experience:
@@ -537,7 +344,6 @@ class NaiveExperienceMaker(ABC):
         num_actions = samples.num_actions
 
         # log probs
-        # import ipdb; ipdb.set_trace()
         action_log_probs = self.actor(sequences, num_actions, attention_mask)
 
         # init log probs
