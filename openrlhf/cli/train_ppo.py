@@ -289,7 +289,7 @@ def train(args):
 
 if __name__ == "__main__":
     import os
-    os.environ["MASTER_PORT"] = "29505" # TODO
+    os.environ["MASTER_PORT"] = "29506" # TODO
 
     parser = argparse.ArgumentParser()
 

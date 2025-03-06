@@ -191,7 +191,7 @@ class NaiveExperienceMaker(ABC):
 
     @torch.no_grad()
     def make_experience_list(
-        self, all_prompts: Union[str, List[str]], backend: str = "vllm", **generate_kwargs
+        self, all_prompts: Union[str, List[str]], all_labels, backend: str = "vllm", **generate_kwargs
     ) -> List[Experience]:
         """
         Make a list of experience with the micro_rollout_batch_size.
@@ -211,7 +211,7 @@ class NaiveExperienceMaker(ABC):
             torch.cuda.synchronize()
 
         # generate responses
-        samples_list = self.generate_samples(all_prompts, backend, **generate_kwargs)
+        samples_list = self.generate_samples(all_prompts, all_labels, backend, **generate_kwargs)
         torch.distributed.barrier()
         torch.cuda.synchronize()
 
@@ -272,7 +272,7 @@ class NaiveExperienceMaker(ABC):
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], backend: str, **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[str], all_labels, backend: str, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
         """
@@ -555,7 +555,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], backend, **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[str], all_labels, backend, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
 
@@ -563,9 +563,9 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         in which actor will be used to generate samples.
         """
         if self.inference_engines is None:
-            return super().generate_samples(all_prompts, backend, **generate_kwargs)
+            return super().generate_samples(all_prompts, all_labels, backend, **generate_kwargs)
 
-        return self.sampling(all_prompts, backend, **generate_kwargs)
+        return self.sampling(all_prompts, all_labels, backend, **generate_kwargs)
 
     @torch.no_grad()
     def make_experience(self, samples: Samples) -> Experience:
@@ -749,7 +749,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         self.actor.train()  # reset model state
         return experience
 
-    def sampling(self, all_prompts: List[str], backend, **kwargs) -> List[Samples]:
+    def sampling(self, all_prompts: List[str], all_labels, backend, **kwargs) -> List[Samples]:
 
         # round-robin load balance
         rank = torch.distributed.get_rank() // self.strategy.ring_attn_size
@@ -775,6 +775,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
 
         # Expand prompt list based on the number of samples per prompt
         all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
+        all_labels = sum([[label] * args.n_samples_per_prompt for label in all_labels], [])
         all_input_token_id_list = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
 
         # Distribute requests to engines and collect responses to outputs
@@ -826,6 +827,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             ]
             assert all(output_token_id[-1] == eos_token_id for output_token_id in output_token_id_list)
 
+            labels = all_labels[i : i + self.strategy.args.micro_rollout_batch_size]
+            
             if not self.packing_samples:
                 # NOTE: concat all outputs to following format:
                 #
