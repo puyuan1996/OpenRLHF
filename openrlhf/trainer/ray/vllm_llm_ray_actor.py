@@ -49,6 +49,7 @@ class VllmLLMRayActor:
                         super().__init__(*args, **kwargs)
 
                 RayWorkerWrapperPath.RayWorkerWrapper = RayWorkerWrapper
+        kwargs.pop("worker_use_ray")
         kwargs.pop("backend")
         self.llm = vllm.LLM(*args, **kwargs)
 

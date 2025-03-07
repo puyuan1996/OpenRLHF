@@ -467,14 +467,14 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         self.packing_samples = packing_samples
 
     @torch.no_grad()
-    def make_experience_list(self, all_prompts: Union[str, List[str]], **generate_kwargs) -> List[Experience]:
+    def make_experience_list(self, all_prompts: Union[str, List[str]], backend: str = "vllm", **generate_kwargs) -> List[Experience]:
         if self.strategy.args.perf:
             self.perf_stats = {
                 "generate_time": 0,
                 "actor_value_rm_time": 0,
                 "wait_time": 0,
             }
-        experiences = super().make_experience_list(all_prompts, **generate_kwargs)
+        experiences = super().make_experience_list(all_prompts, backend, **generate_kwargs)
         if self.critic is not None:
             for experience in experiences:
                 # send experience to critic
