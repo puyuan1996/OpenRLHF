@@ -72,7 +72,7 @@ def get_vllm_engine(args):
         task="generate",
         tensor_parallel_size=args.engine_tp_size,
         gpu_memory_utilization=args.engine_mem_util,
-        distributed_executor_backend="external_launcher",  # TODO： 非常重要
+        distributed_executor_backend="external_launcher",
         worker_cls="lightrlhf.strategy.vllm_utils.vllm_worker_wrap_no_ray.WorkerWrap",
         enable_sleep_mode=args.enable_engine_sleep,
     )
@@ -117,18 +117,20 @@ class Samples:
 # -------------------------------
 
 class VLLMBackend(BaseGenerationBackend):
-    def __init__(self, args, tokenizer, prompt_max_len: int = 1024):
+    def __init__(self, model_name: str, tokenizer, prompt_max_len: int = 1024, tensor_parallel_size=1, **kwargs):
         """
-        args: 包含 vLLM 引擎参数的对象
+        model_name: 模型名称或路径（不再直接传入，实际初始化在 get_vllm_engine 内处理）
         tokenizer: 用于 tokenization 的对象
         prompt_max_len: prompt 最大长度
+        tensor_parallel_size: 张量并行大小
+        kwargs: 传给 vllm.LLM 的其他参数
         """
         self.tokenizer = tokenizer
+        from vllm import LLM
+        print(f"Initializing vLLM LLM with tensor_parallel_size: {tensor_parallel_size}")
+        # 注意这里指定了 task="generate"
+        self.llm = LLM(model=model_name, task="generate", tensor_parallel_size=tensor_parallel_size, **kwargs)
         self.prompt_max_len = prompt_max_len
-
-        # 通过 get_vllm_engine 获取 vLLM 引擎和 TP 分组
-        print(f"Initializing vLLM engine via get_vllm_engine with tensor_parallel_size: {args.engine_tp_size}")
-        self.llm, self.tp_group = get_vllm_engine(args)
 
     @torch.no_grad()
     def generate(self, prompts: List[str], labels: List[str], generate_kwargs: dict = {}) -> List[Samples]:
@@ -187,6 +189,7 @@ class SimpleModel(nn.Module):
     def forward(self, x=None, prompts=None, labels=None, generate_kwargs={}, vllm_backend=None):
         import torch.distributed as dist
         
+        # if self.use_vllm and vllm_backend is not None and dist.get_rank() == 0:
         if self.use_vllm and vllm_backend is not None:
             print(f'rank {dist.get_rank()}: =========debug: pos 4=========')
             samples = vllm_backend.generate(prompts, labels, generate_kwargs)
@@ -233,6 +236,10 @@ def main():
     )
     strategy.setup_distributed()
 
+    # import torch.distributed as dist
+    # args.engine_tp_size = dist.get_world_size()
+    # args.engine_tp_size = 1
+
     # 构造一个简单的 dummy tokenizer，实际请使用 Hugging Face tokenizer
     class DummyTokenizer:
         def __init__(self):
@@ -250,12 +257,18 @@ def main():
 
     tokenizer = DummyTokenizer()
 
+
     # 方式一：使用 vllm 推理模式（仅生成调用，不用于梯度更新）
-    # 通过 get_vllm_engine 在 VLLMBackend 内部初始化，因此这里只需传入 args 和 tokenizer
+    # 注意：这里使用自定义包装类 VLLMBackend 进行初始化，保证输入 prompt 会先经过分词处理
     vllm_backend = VLLMBackend(
-        args=args,
+        model_name=args.pretrain,
         tokenizer=tokenizer,
-        prompt_max_len=1024
+        prompt_max_len=1024,
+        tensor_parallel_size=args.engine_tp_size,
+        gpu_memory_utilization=args.engine_mem_util,
+        distributed_executor_backend="external_launcher",
+        worker_cls="lightrlhf.strategy.vllm_utils.vllm_worker_wrap_no_ray.WorkerWrap",
+        enable_sleep_mode=args.enable_engine_sleep,
     )
     
     print(f'rank {dist.get_rank()}: =========debug: pos 0=========')
@@ -271,51 +284,53 @@ def main():
     )
     print(f'rank {dist.get_rank()}: =========debug: pos 1=========')
 
+
     # 设置生成输入（这里仅取两个示例文本）
     prompts = ["Hello, how are you?", "What is the weather today?"]
     labels = ["I am fine", "Sunny and warm"]
 
     model_vllm.eval()
     with torch.no_grad():
+        # dist.barrier(device_ids=[torch.cuda.current_device()])
         generated = model_vllm(prompts=prompts, labels=labels, generate_kwargs={}, vllm_backend=vllm_backend)
         print(f'rank {dist.get_rank()}: =========debug: pos 2=========')
-        # strategy.print(f"rank {dist.get_rank()}:  vLLM 模式下生成的序列 tensor:", generated)
-        print(f"rank {dist.get_rank()}:  vLLM 模式下生成的序列 tensor:", generated)
+        # dist.barrier(device_ids=[torch.cuda.current_device()])
+        strategy.print("vLLM 模式下生成的序列 tensor:", generated)
 
     print(f'rank {dist.get_rank()}: =========debug: pos 3=========')
 
     # 方式二：普通前向传播训练
-    # model_training = SimpleModel(use_vllm=False)
-    # optimizer_training = optim.Adam(model_training.parameters(), lr=1e-3)
-    # scheduler_training = StepLR(optimizer_training, step_size=10, gamma=0.1)
+    model_training = SimpleModel(use_vllm=False)
+    optimizer_training = optim.Adam(model_training.parameters(), lr=1e-3)
+    scheduler_training = StepLR(optimizer_training, step_size=10, gamma=0.1)
 
-    # model_training, optimizer_training, scheduler_training = strategy.prepare(
-    #     (model_training, optimizer_training, scheduler_training),
-    #     is_rlhf=False
-    # )
+    model_training, optimizer_training, scheduler_training = strategy.prepare(
+        (model_training, optimizer_training, scheduler_training),
+        is_rlhf=False
+    )
 
-    # inputs = torch.randn(1000, 10).cuda()
-    # targets = torch.randn(1000, 1).cuda()
-    # dataset = TensorDataset(inputs, targets)
-    # dataloader = DataLoader(dataset, batch_size=strategy.micro_train_batch_size, shuffle=True)
+    inputs = torch.randn(1000, 10).cuda()
+    targets = torch.randn(1000, 1).cuda()
+    dataset = TensorDataset(inputs, targets)
+    dataloader = DataLoader(dataset, batch_size=strategy.micro_train_batch_size, shuffle=True)
 
-    # model_training.train()
-    # num_epochs = 2
-    # for epoch in range(num_epochs):
-    #     for i, (x, y) in enumerate(dataloader):
-    #         outputs = model_training(x)
-    #         loss = ((outputs - y) ** 2).mean()
-    #         model_training.backward(loss)
-    #         if (i + 1) % strategy.accumulated_gradient == 0:
-    #             model_training.step()
-    #             optimizer_training.zero_grad()
-    #             strategy.print(f"Epoch {epoch}, Step {i}: loss = {loss.item()}")
+    model_training.train()
+    num_epochs = 2
+    for epoch in range(num_epochs):
+        for i, (x, y) in enumerate(dataloader):
+            outputs = model_training(x)
+            loss = ((outputs - y) ** 2).mean()
+            model_training.backward(loss)
+            if (i + 1) % strategy.accumulated_gradient == 0:
+                model_training.step()
+                optimizer_training.zero_grad()
+                strategy.print(f"Epoch {epoch}, Step {i}: loss = {loss.item()}")
 
-    # if strategy.is_rank_0():
-    #     save_dir = "./saved_model_debug"
-    #     os.makedirs(save_dir, exist_ok=True)
-    #     model_training.save_checkpoint(save_dir, tag="final_checkpoint_debug")
-    #     strategy.print("Training completed and model saved.")
+    if strategy.is_rank_0():
+        save_dir = "./saved_model_debug"
+        os.makedirs(save_dir, exist_ok=True)
+        model_training.save_checkpoint(save_dir, tag="final_checkpoint_debug")
+        strategy.print("Training completed and model saved.")
 
 if __name__ == '__main__':
     # torchrun --nnodes=1 --nproc-per-node 8 /fs-computility/ai-shen/puyuan/code/OpenRLHF/openrlhf/utils/deepspeed/eval_deepspeed_vllm_train.py 

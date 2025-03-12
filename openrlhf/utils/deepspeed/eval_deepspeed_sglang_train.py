@@ -16,16 +16,19 @@ from torch.utils.data import DataLoader, TensorDataset
 from collections import defaultdict
 from typing import List, Tuple, Union
 
-# 假设 DeepspeedStrategy 已经定义（如你的 deepspeed demo 代码中所示），本例中从 openrlhf 导入
+# 假设 DeepspeedStrategy 已经在 openrlhf 内部定义
 from openrlhf.utils.deepspeed.deepspeed_strategy import DeepspeedStrategy
 
 import torch.distributed as dist
 
+# -------------------------------
+# 分布式子分组（如果需要）
+# -------------------------------
 def create_sub_group(group_size: int):
     """创建 TP/PP 分组，如果 world_size 可以整除 group_size，则生成所有组并测试通信"""
     world_size = dist.get_world_size()
     if world_size % group_size != 0:
-        raise ValueError(f"world_size ({world_size}) % group_size ({group_size}) != 0 ")
+        raise ValueError(f"world_size ({world_size}) % group_size ({group_size}) != 0")
 
     num_groups = world_size // group_size
     all_group_ranks = []
@@ -48,45 +51,32 @@ def create_sub_group(group_size: int):
     assert abs(tmp.item() - 1.1) < 1e-4
     if dist.get_rank() == 0:
         print("Finished testing comm!", flush=True)
-
     return group
 
-
 # -------------------------------
-# vLLM 初始化接口
+# vLLM 中的 get_vllm_engine 类似，这里新增 get_sglang_engine
 # -------------------------------
-
-def get_vllm_engine(args):
+def get_sglang_engine(args):
     """
-    根据参数构建 vLLM 引擎，并返回引擎对象以及分组
+    根据参数构建 sglang 引擎，并返回引擎对象以及子分组（如果有需要）。
+    目前示例中直接初始化 sglang 引擎，无需额外分组，返回 None。
     """
-    # 建立张量并行组，确保 world_size 可以整除 engine_tp_size
-    vllm_tp_group = create_sub_group(args.engine_tp_size)
+    import sglang as sgl
 
-    # 延迟导入 vllm，仅在真正初始化时导入
-    from vllm import LLM
+    # 如有需要可以根据 args 创建 tensor parallel group：
+    sglang_tp_group = create_sub_group(args.engine_tp_size)  # 示例：如果 args 中有该参数
 
-    # 确保设置 task="generate"
-    vllm_engine = LLM(
-        model=args.pretrain,
-        task="generate",
-        tensor_parallel_size=args.engine_tp_size,
-        gpu_memory_utilization=args.engine_mem_util,
-        distributed_executor_backend="external_launcher",  # TODO： 非常重要
-        worker_cls="lightrlhf.strategy.vllm_utils.vllm_worker_wrap_no_ray.WorkerWrap",
-        enable_sleep_mode=args.enable_engine_sleep,
-    )
+    print(f'rank {dist.get_rank()}: =========debug: pos 1 =========')
 
-    return vllm_engine, vllm_tp_group
+    # 目前未使用额外的分组
+    sglang_engine = sgl.Engine(model_path=args.pretrain)
+    print(f'rank {dist.get_rank()}: =========debug: pos 2 =========')
+
+    return sglang_engine, None
 
 # -------------------------------
-# 原有 BaseGenerationBackend 和 Samples 保持不变
+# Samples 和 BaseGenerationBackend 定义
 # -------------------------------
-
-class BaseGenerationBackend:
-    def generate(self, prompts: List[str], labels: List[str], generate_kwargs: dict = {}) -> List:
-        raise NotImplementedError
-
 class Samples:
     def __init__(
         self,
@@ -112,44 +102,59 @@ class Samples:
         self.labels = labels
         self.pad_len = pad_len
 
-# -------------------------------
-# 修改后的 VLLMBackend
-# -------------------------------
+class BaseGenerationBackend:
+    def generate(self, prompts: List[str], labels: List[str], generate_kwargs: dict = {}) -> List:
+        raise NotImplementedError
 
-class VLLMBackend(BaseGenerationBackend):
+# -------------------------------
+# SGLangBackend 基于 sglang 工具包实现文本生成接口，
+# 采用 get_sglang_engine 获取引擎并赋值给 self.engine
+# -------------------------------
+class SGLangBackend(BaseGenerationBackend):
     def __init__(self, args, tokenizer, prompt_max_len: int = 1024):
         """
-        args: 包含 vLLM 引擎参数的对象
-        tokenizer: 用于 tokenization 的对象
+        args: 包含 sglang 引擎参数的对象，其中 pretrain 为模型路径
+        tokenizer: 用于 tokenization 的 tokenizer 对象
         prompt_max_len: prompt 最大长度
         """
         self.tokenizer = tokenizer
         self.prompt_max_len = prompt_max_len
-
-        # 通过 get_vllm_engine 获取 vLLM 引擎和 TP 分组
-        print(f"Initializing vLLM engine via get_vllm_engine with tensor_parallel_size: {args.engine_tp_size}")
-        self.llm, self.tp_group = get_vllm_engine(args)
-
+        print(f"Initializing sglang engine via get_sglang_engine with model path: {args.pretrain}")
+        self.engine, _ = get_sglang_engine(args)
+    
     @torch.no_grad()
     def generate(self, prompts: List[str], labels: List[str], generate_kwargs: dict = {}) -> List[Samples]:
-        # 调用 vLLM.generate 接口进行生成
-        outputs = self.llm.generate(prompts, **generate_kwargs)
+        # 采样参数：可通过 generate_kwargs 传入采样配置，否则使用默认值
+        sampling_params = generate_kwargs.get("sampling_params", {"temperature": 0.8, "top_p": 0.95})
         samples_list = []
         pad_token_id = self.tokenizer.pad_token_id if hasattr(self.tokenizer, "pad_token_id") else 0
         eos_token_id = self.tokenizer.eos_token_id if hasattr(self.tokenizer, "eos_token_id") else 1
 
-        for prompt, label, output in zip(prompts, labels, outputs):
-            output_token_ids = list(output.outputs[0].token_ids)
-            if output_token_ids[-1] != eos_token_id:
-                output_token_ids.append(eos_token_id)
-            prompt_ids = self.tokenizer(
+        for prompt, label in zip(prompts, labels):
+            # 调用 sglang 引擎生成，注意 sglang 的 generate 接口要求传入 prompt 列表
+            outputs = self.engine.generate([prompt], sampling_params=sampling_params)
+            # 获取 sglang 返回的第一个结果
+            output_dict = outputs[0]
+            # 从结果中获取生成文本
+            generated_text = output_dict.get("text", "")
+            # 可以检查是否存在 eos_token, 此处示例简单拼接
+            if len(generated_text) == 0 or generated_text[-1] != chr(eos_token_id):
+                # 此处仅为示例，实际请根据 tokenizer 的 eos_token_id 处理
+                generated_text += chr(eos_token_id)
+
+            # Tokenize prompt 和生成文本
+            prompt_tokens = self.tokenizer(
                 prompt, add_special_tokens=False, max_length=self.prompt_max_len, truncation=True
             )["input_ids"]
-            all_ids = prompt_ids + output_token_ids
-            sequences = torch.tensor([all_ids])
+            generated_tokens = self.tokenizer(
+                generated_text, add_special_tokens=False
+            )["input_ids"]
+            all_token_ids = prompt_tokens + generated_tokens
+            sequences = torch.tensor([all_token_ids])
             attention_mask = (sequences != pad_token_id).float()
             action_mask = torch.zeros_like(sequences, dtype=torch.bool)
-            action_mask[:, len(prompt_ids):] = 1
+            # 指定 prompt 之外部分为可操作区域
+            action_mask[:, len(prompt_tokens):] = 1
 
             sequences = sequences.to("cuda")
             attention_mask = attention_mask.to("cuda")
@@ -171,37 +176,36 @@ class VLLMBackend(BaseGenerationBackend):
         return samples_list
 
 # -------------------------------
-# 简单模型示例（普通前向传播和 vllm 模式）
+# 示例模型：支持普通前向传播和 sglang 推理模式
 # -------------------------------
-
 class SimpleModel(nn.Module):
-    def __init__(self, input_dim=10, hidden_dim=20, output_dim=1, use_vllm=False):
+    def __init__(self, input_dim=10, hidden_dim=20, output_dim=1, use_sglang=False):
         super(SimpleModel, self).__init__()
-        self.use_vllm = use_vllm
+        self.use_sglang = use_sglang
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, output_dim)
         )
         
-    def forward(self, x=None, prompts=None, labels=None, generate_kwargs={}, vllm_backend=None):
+    def forward(self, x=None, prompts=None, labels=None, generate_kwargs={}, sglang_backend=None):
         import torch.distributed as dist
         
-        if self.use_vllm and vllm_backend is not None:
-            print(f'rank {dist.get_rank()}: =========debug: pos 4=========')
-            samples = vllm_backend.generate(prompts, labels, generate_kwargs)
+        if self.use_sglang and sglang_backend is not None:
+            print(f'rank {dist.get_rank()}: =========debug: sglang generation mode =========')
+            samples = sglang_backend.generate(prompts, labels, generate_kwargs)
             return samples[0].sequences
-        elif self.use_vllm:
+        elif self.use_sglang:
             # 非推理进程返回 dummy 结果
             return torch.zeros((1, 10), device='cuda')
         else:
             return self.net(x)
 
 ###############################################################################
-# 主函数，展示如何在 DeepSpeed 训练过程中使用 vllm 推理以及普通训练模式
+# 主函数，展示如何在 DeepSpeed 训练过程中使用 sglang 推理以及普通训练模式
 ###############################################################################
 def main():
-    # 模拟 DeepSpeed 的命令行参数，一般由 launcher 传入
+    # 模拟 DeepSpeed 的命令行参数，通常由 launcher 传入
     class Args:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         adam_offload = False
@@ -213,15 +217,13 @@ def main():
         train_batch_size = 32
         max_norm = 1.0
 
-        # 以下为 vLLM 引擎参数
-        engine_tp_size = 2      # tensor parallel 的大小，可根据需要调整
-        engine_mem_util = 0.5   # GPU 内存利用率限制（示例）
+        # sglang 引擎参数：模型路径，请确保该路径正确
         pretrain = "/fs-computility/ai-shen/puyuan/model/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987"
-        enable_engine_sleep = True
+        # 如有需要可以增加 engine_tp_size 等其他参数
 
     args = Args()
 
-    # 初始化 deepspeed strategy，并设置分布式环境
+    # 初始化 DeepSpeed strategy 并设置分布式环境
     strategy = DeepspeedStrategy(
         seed=42,
         max_norm=args.max_norm,
@@ -233,13 +235,15 @@ def main():
     )
     strategy.setup_distributed()
 
-    # 构造一个简单的 dummy tokenizer，实际请使用 Hugging Face tokenizer
+    # 构造一个简单的 dummy tokenizer（实际工程建议使用 Hugging Face tokenizer）
     class DummyTokenizer:
         def __init__(self):
             self.pad_token_id = 0
+            # 为便于示例，这里将 eos_token_id 与一个字符关联（例如 1 对应 ASCII SOH）
             self.eos_token_id = 1
 
         def __call__(self, text, add_special_tokens=True, max_length=None, truncation=False):
+            # 简单示例：将每个字符转换为其 ASCII 码的末两位，并截断至 max_length
             token_ids = [ord(c) % 100 for c in text][:max_length]
             return {"input_ids": token_ids}
 
@@ -250,55 +254,60 @@ def main():
 
     tokenizer = DummyTokenizer()
 
-    # 方式一：使用 vllm 推理模式（仅生成调用，不用于梯度更新）
-    # 通过 get_vllm_engine 在 VLLMBackend 内部初始化，因此这里只需传入 args 和 tokenizer
-    vllm_backend = VLLMBackend(
+    print(f'rank {dist.get_rank()}: =========debug: pos 0 =========')
+
+    # 方式一：使用 sglang 推理模式（生成调用，不用于梯度更新）
+    sglang_backend = SGLangBackend(
         args=args,
         tokenizer=tokenizer,
         prompt_max_len=1024
     )
     
-    print(f'rank {dist.get_rank()}: =========debug: pos 0=========')
+    print(f'rank {dist.get_rank()}: =========debug: starting sglang generation test =========')
 
-    model_vllm = SimpleModel(use_vllm=True)
-    model_vllm, optimizer_vllm, scheduler_vllm = strategy.prepare(
+    model_sgl = SimpleModel(use_sglang=True)
+    model_sgl, optimizer_sgl, scheduler_sgl = strategy.prepare(
         (
-            model_vllm, 
-            optim.Adam(model_vllm.parameters(), lr=1e-3), 
-            StepLR(optim.Adam(model_vllm.parameters(), lr=1e-3), step_size=10, gamma=0.1)
+            model_sgl, 
+            optim.Adam(model_sgl.parameters(), lr=1e-3), 
+            StepLR(optim.Adam(model_sgl.parameters(), lr=1e-3), step_size=10, gamma=0.1)
         ),
         is_rlhf=False
     )
-    print(f'rank {dist.get_rank()}: =========debug: pos 1=========')
+    print(f'rank {dist.get_rank()}: =========debug: prepared model_sgl =========')
 
-    # 设置生成输入（这里仅取两个示例文本）
-    prompts = ["Hello, how are you?", "What is the weather today?"]
-    labels = ["I am fine", "Sunny and warm"]
+    # 设置生成时的输入示例
+    prompts = ["你好，今天天气如何？", "请问量子计算的基本原理是什么？"]
+    labels = ["今天天气晴朗", "量子计算基于量子力学原理"]
 
-    model_vllm.eval()
+    model_sgl.eval()
     with torch.no_grad():
-        generated = model_vllm(prompts=prompts, labels=labels, generate_kwargs={}, vllm_backend=vllm_backend)
-        print(f'rank {dist.get_rank()}: =========debug: pos 2=========')
-        # strategy.print(f"rank {dist.get_rank()}:  vLLM 模式下生成的序列 tensor:", generated)
-        print(f"rank {dist.get_rank()}:  vLLM 模式下生成的序列 tensor:", generated)
+        generated = model_sgl(
+            prompts=prompts, 
+            labels=labels, 
+            generate_kwargs={"sampling_params": {"temperature": 0.8, "top_p": 0.95}},
+            sglang_backend=sglang_backend
+        )
+        print(f'rank {dist.get_rank()}: =========debug: sglang generation output =========')
+        print(f"rank {dist.get_rank()}: sglang 模式下生成的序列 tensor:", generated)
 
-    print(f'rank {dist.get_rank()}: =========debug: pos 3=========')
+    print(f'rank {dist.get_rank()}: =========debug: sglang generation test finished =========')
 
-    # 方式二：普通前向传播训练
-    # model_training = SimpleModel(use_vllm=False)
+    # 方式二：普通前向传播训练（用于梯度更新）的示例（代码已注释，可按需启用）
+    # model_training = SimpleModel(use_sglang=False)
     # optimizer_training = optim.Adam(model_training.parameters(), lr=1e-3)
     # scheduler_training = StepLR(optimizer_training, step_size=10, gamma=0.1)
-
+    #
     # model_training, optimizer_training, scheduler_training = strategy.prepare(
     #     (model_training, optimizer_training, scheduler_training),
     #     is_rlhf=False
     # )
-
+    #
     # inputs = torch.randn(1000, 10).cuda()
     # targets = torch.randn(1000, 1).cuda()
     # dataset = TensorDataset(inputs, targets)
     # dataloader = DataLoader(dataset, batch_size=strategy.micro_train_batch_size, shuffle=True)
-
+    #
     # model_training.train()
     # num_epochs = 2
     # for epoch in range(num_epochs):
@@ -310,13 +319,14 @@ def main():
     #             model_training.step()
     #             optimizer_training.zero_grad()
     #             strategy.print(f"Epoch {epoch}, Step {i}: loss = {loss.item()}")
-
+    #
     # if strategy.is_rank_0():
-    #     save_dir = "./saved_model_debug"
+    #     save_dir = "./saved_model_sgl_debug"
     #     os.makedirs(save_dir, exist_ok=True)
-    #     model_training.save_checkpoint(save_dir, tag="final_checkpoint_debug")
+    #     model_training.save_checkpoint(save_dir, tag="final_checkpoint_sgl_debug")
     #     strategy.print("Training completed and model saved.")
 
 if __name__ == '__main__':
-    # torchrun --nnodes=1 --nproc-per-node 8 /fs-computility/ai-shen/puyuan/code/OpenRLHF/openrlhf/utils/deepspeed/eval_deepspeed_vllm_train.py 
+    # 示例运行命令：
+    # torchrun --nnodes=1 --nproc-per-node 2 /fs-computility/ai-shen/puyuan/code/OpenRLHF/openrlhf/utils/deepspeed/eval_deepspeed_sglang_train.py
     main()

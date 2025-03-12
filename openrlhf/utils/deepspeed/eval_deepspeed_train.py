@@ -91,4 +91,5 @@ def main():
         strategy.print("Training completed and model saved.")
 
 if __name__ == '__main__':
+    # torchrun --nnodes=1 --nproc-per-node 8 /fs-computility/ai-shen/puyuan/code/OpenRLHF/openrlhf/utils/deepspeed/eval_deepspeed_train.py 
     main()
