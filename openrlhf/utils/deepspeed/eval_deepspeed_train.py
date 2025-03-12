@@ -84,11 +84,11 @@ def main():
                 strategy.print(f"Epoch {epoch}, Step {i}: loss = {loss.item()}")
 
     # 保存训练好的模型（仅在 rank 0 上执行保存操作）
-    if strategy.is_rank_0():
-        save_dir = "./saved_model_debug"
-        os.makedirs(save_dir, exist_ok=True)
-        model.save_checkpoint(save_dir, tag="final_checkpoint_debug")
-        strategy.print("Training completed and model saved.")
+    # if strategy.is_rank_0():
+    save_dir = "./saved_model_debug"
+    os.makedirs(save_dir, exist_ok=True)
+    model.save_checkpoint(save_dir, tag="final_checkpoint_debug")
+    strategy.print("Training completed and model saved.")
 
 if __name__ == '__main__':
     # torchrun --nnodes=1 --nproc-per-node 8 /fs-computility/ai-shen/puyuan/code/OpenRLHF/openrlhf/utils/deepspeed/eval_deepspeed_train.py 

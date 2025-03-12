@@ -16,13 +16,14 @@ from torch.utils.data import DataLoader, TensorDataset
 from collections import defaultdict
 from typing import List, Tuple, Union
 
-# 假设 DeepspeedStrategy 已经定义（如你的 deepspeed demo 代码中所示），本例中从 openrlhf 导入
 from openrlhf.utils.deepspeed.deepspeed_strategy import DeepspeedStrategy
 
 import torch.distributed as dist
 
 def create_sub_group(group_size: int):
-    """创建 TP/PP 分组，如果 world_size 可以整除 group_size，则生成所有组并测试通信"""
+    """
+    创建 TP/PP 分组，只在初始化阶段调用一次；通信测试部分可以在调试时启用，生产环境中建议禁用
+    """
     world_size = dist.get_world_size()
     if world_size % group_size != 0:
         raise ValueError(f"world_size ({world_size}) % group_size ({group_size}) != 0 ")
@@ -45,12 +46,11 @@ def create_sub_group(group_size: int):
     tmp = torch.tensor(1.1, device="cuda")
     dist.all_reduce(tmp, group=group, op=dist.ReduceOp.AVG)
     dist.barrier()
-    assert abs(tmp.item() - 1.1) < 1e-4
+    assert abs(tmp.item() - 1.1) < 1e-4, "通信测试失败！"
     if dist.get_rank() == 0:
         print("Finished testing comm!", flush=True)
 
     return group
-
 
 # -------------------------------
 # vLLM 初始化接口
@@ -60,20 +60,19 @@ def get_vllm_engine(args):
     """
     根据参数构建 vLLM 引擎，并返回引擎对象以及分组
     """
-    # 建立张量并行组，确保 world_size 可以整除 engine_tp_size
+    # 建立张量并行组，此处仅调用一次分组创建（建议在初始化时）
     vllm_tp_group = create_sub_group(args.engine_tp_size)
 
     # 延迟导入 vllm，仅在真正初始化时导入
     from vllm import LLM
 
-    # 确保设置 task="generate"
     vllm_engine = LLM(
         model=args.pretrain,
         task="generate",
         tensor_parallel_size=args.engine_tp_size,
         gpu_memory_utilization=args.engine_mem_util,
         distributed_executor_backend="external_launcher",  # TODO： 非常重要
-        worker_cls="lightrlhf.strategy.vllm_utils.vllm_worker_wrap_no_ray.WorkerWrap",
+        # worker_cls="lightrlhf.strategy.vllm_utils.vllm_worker_wrap_no_ray.WorkerWrap",
         enable_sleep_mode=args.enable_engine_sleep,
     )
 
@@ -126,7 +125,7 @@ class VLLMBackend(BaseGenerationBackend):
         self.tokenizer = tokenizer
         self.prompt_max_len = prompt_max_len
 
-        # 通过 get_vllm_engine 获取 vLLM 引擎和 TP 分组
+        # if dist.get_rank() == 0:
         print(f"Initializing vLLM engine via get_vllm_engine with tensor_parallel_size: {args.engine_tp_size}")
         self.llm, self.tp_group = get_vllm_engine(args)
 
@@ -146,14 +145,11 @@ class VLLMBackend(BaseGenerationBackend):
                 prompt, add_special_tokens=False, max_length=self.prompt_max_len, truncation=True
             )["input_ids"]
             all_ids = prompt_ids + output_token_ids
-            sequences = torch.tensor([all_ids])
+            sequences = torch.tensor([all_ids], device="cuda")
             attention_mask = (sequences != pad_token_id).float()
             action_mask = torch.zeros_like(sequences, dtype=torch.bool)
+            # 假设 action 从 prompt 长度开始生效
             action_mask[:, len(prompt_ids):] = 1
-
-            sequences = sequences.to("cuda")
-            attention_mask = attention_mask.to("cuda")
-            action_mask = action_mask.to("cuda")
 
             samples = Samples(
                 sequences=sequences,
@@ -185,14 +181,15 @@ class SimpleModel(nn.Module):
         )
         
     def forward(self, x=None, prompts=None, labels=None, generate_kwargs={}, vllm_backend=None):
-        import torch.distributed as dist
-        
+        # 注意：仅当 use_vllm 为 True 且传入 vllm_backend 时调用生成接口
         if self.use_vllm and vllm_backend is not None:
-            print(f'rank {dist.get_rank()}: =========debug: pos 4=========')
+            # 为确保调试信息顺序，建议只在 rank 0 输出日志
+            # if dist.get_rank() == 0:
+            print(f'rank {dist.get_rank()}: =========vLLM generate invoked=========')
             samples = vllm_backend.generate(prompts, labels, generate_kwargs)
             return samples[0].sequences
         elif self.use_vllm:
-            # 非推理进程返回 dummy 结果
+            # 非推理进程返回 dummy 结果，确保所有进程均返回结果，避免分布式 hang
             return torch.zeros((1, 10), device='cuda')
         else:
             return self.net(x)
@@ -214,14 +211,16 @@ def main():
         max_norm = 1.0
 
         # 以下为 vLLM 引擎参数
-        engine_tp_size = 2      # tensor parallel 的大小，可根据需要调整
         engine_mem_util = 0.5   # GPU 内存利用率限制（示例）
-        pretrain = "/fs-computility/ai-shen/puyuan/model/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987"
+        # engine_tp_size = 8      # tensor parallel 的大小，根据实际环境调整
+        # pretrain = "/fs-computility/ai-shen/puyuan/model/huggingface/hub/models--OpenRLHF--Llama-3-8b-sft-mixture/snapshots/03334dc4a796d9d72850ead46956c33da22e6d7b"
+        engine_tp_size = 4      # tensor parallel 的大小，根据实际环境调整
+        pretrain = "Qwen/Qwen2.5-7B-Instruct"
         enable_engine_sleep = True
 
     args = Args()
 
-    # 初始化 deepspeed strategy，并设置分布式环境
+    # DeepSpeed Strategy 初始化与分布式环境设置
     strategy = DeepspeedStrategy(
         seed=42,
         max_norm=args.max_norm,
@@ -233,33 +232,27 @@ def main():
     )
     strategy.setup_distributed()
 
-    # 构造一个简单的 dummy tokenizer，实际请使用 Hugging Face tokenizer
-    class DummyTokenizer:
-        def __init__(self):
-            self.pad_token_id = 0
-            self.eos_token_id = 1
+    # 尝试加载预训练模型对应的 tokenizer，如果加载失败则从 Hugging Face 下载 Qwen2.5-7B 的 tokenizer
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.pretrain)
+        print("成功加载预训练tokenizer:", args.pretrain)
+    except Exception as e:
+        print("加载预训练的tokenizer失败，尝试从 Hugging Face 下载 Qwen2.5-7B 的tokenizer。错误信息：", e)
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
 
-        def __call__(self, text, add_special_tokens=True, max_length=None, truncation=False):
-            token_ids = [ord(c) % 100 for c in text][:max_length]
-            return {"input_ids": token_ids}
-
-        def save_pretrained(self, output_dir):
-            os.makedirs(output_dir, exist_ok=True)
-            with open(os.path.join(output_dir, "tokenizer.txt"), "w", encoding="utf-8") as f:
-                f.write("Dummy tokenizer parameters.")
-
-    tokenizer = DummyTokenizer()
-
-    # 方式一：使用 vllm 推理模式（仅生成调用，不用于梯度更新）
-    # 通过 get_vllm_engine 在 VLLMBackend 内部初始化，因此这里只需传入 args 和 tokenizer
+    # 方式一：vLLM 推理模式（仅用于生成不参与梯度更新）
     vllm_backend = VLLMBackend(
         args=args,
         tokenizer=tokenizer,
         prompt_max_len=1024
     )
     
-    print(f'rank {dist.get_rank()}: =========debug: pos 0=========')
+    if dist.get_rank() == 0:
+        print(f'rank {dist.get_rank()}: =========Starting vLLM mode inference=========')
 
+    # 包装 vLLM 模式下的模型和优化器（注意：vLLM 模式下梯度不参与更新，但依然需调用 prepare 保持进程同步）
     model_vllm = SimpleModel(use_vllm=True)
     model_vllm, optimizer_vllm, scheduler_vllm = strategy.prepare(
         (
@@ -269,7 +262,9 @@ def main():
         ),
         is_rlhf=False
     )
-    print(f'rank {dist.get_rank()}: =========debug: pos 1=========')
+    
+    if dist.get_rank() == 0:
+        print(f'rank {dist.get_rank()}: =========vLLM model prepared=========')
 
     # 设置生成输入（这里仅取两个示例文本）
     prompts = ["Hello, how are you?", "What is the weather today?"]
@@ -278,45 +273,14 @@ def main():
     model_vllm.eval()
     with torch.no_grad():
         generated = model_vllm(prompts=prompts, labels=labels, generate_kwargs={}, vllm_backend=vllm_backend)
-        print(f'rank {dist.get_rank()}: =========debug: pos 2=========')
-        # strategy.print(f"rank {dist.get_rank()}:  vLLM 模式下生成的序列 tensor:", generated)
-        print(f"rank {dist.get_rank()}:  vLLM 模式下生成的序列 tensor:", generated)
+        # if dist.get_rank() == 0:
+        print(f"rank {dist.get_rank()}: vLLM 模式下生成的序列 tensor:\n", generated)
 
-    print(f'rank {dist.get_rank()}: =========debug: pos 3=========')
+    if dist.get_rank() == 0:
+        print(f'rank {dist.get_rank()}: =========Finished vLLM inference=========')
 
-    # 方式二：普通前向传播训练
-    # model_training = SimpleModel(use_vllm=False)
-    # optimizer_training = optim.Adam(model_training.parameters(), lr=1e-3)
-    # scheduler_training = StepLR(optimizer_training, step_size=10, gamma=0.1)
-
-    # model_training, optimizer_training, scheduler_training = strategy.prepare(
-    #     (model_training, optimizer_training, scheduler_training),
-    #     is_rlhf=False
-    # )
-
-    # inputs = torch.randn(1000, 10).cuda()
-    # targets = torch.randn(1000, 1).cuda()
-    # dataset = TensorDataset(inputs, targets)
-    # dataloader = DataLoader(dataset, batch_size=strategy.micro_train_batch_size, shuffle=True)
-
-    # model_training.train()
-    # num_epochs = 2
-    # for epoch in range(num_epochs):
-    #     for i, (x, y) in enumerate(dataloader):
-    #         outputs = model_training(x)
-    #         loss = ((outputs - y) ** 2).mean()
-    #         model_training.backward(loss)
-    #         if (i + 1) % strategy.accumulated_gradient == 0:
-    #             model_training.step()
-    #             optimizer_training.zero_grad()
-    #             strategy.print(f"Epoch {epoch}, Step {i}: loss = {loss.item()}")
-
-    # if strategy.is_rank_0():
-    #     save_dir = "./saved_model_debug"
-    #     os.makedirs(save_dir, exist_ok=True)
-    #     model_training.save_checkpoint(save_dir, tag="final_checkpoint_debug")
-    #     strategy.print("Training completed and model saved.")
 
 if __name__ == '__main__':
-    # torchrun --nnodes=1 --nproc-per-node 8 /fs-computility/ai-shen/puyuan/code/OpenRLHF/openrlhf/utils/deepspeed/eval_deepspeed_vllm_train.py 
+    # 示例启动命令：
+    # torchrun --nnodes=1 --nproc-per-node 8 /fs-computility/ai-shen/puyuan/code/OpenRLHF/openrlhf/utils/deepspeed/eval_deepspeed_vllm_train.py
     main()

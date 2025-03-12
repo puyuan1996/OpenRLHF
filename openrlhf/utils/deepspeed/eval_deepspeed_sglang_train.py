@@ -69,7 +69,12 @@ def get_sglang_engine(args):
     print(f'rank {dist.get_rank()}: =========debug: pos 1 =========')
 
     # 目前未使用额外的分组
-    sglang_engine = sgl.Engine(model_path=args.pretrain)
+    if dist.get_rank() == 0:
+        sglang_engine = sgl.Engine(model_path=args.pretrain)
+        # sglang_engine = sgl.Engine(model_path=args.pretrain, distributed_executor_backend="external_launcher")
+    else:
+        sglang_engine = None
+
     print(f'rank {dist.get_rank()}: =========debug: pos 2 =========')
 
     return sglang_engine, None
@@ -220,6 +225,9 @@ def main():
         # sglang 引擎参数：模型路径，请确保该路径正确
         pretrain = "/fs-computility/ai-shen/puyuan/model/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987"
         # 如有需要可以增加 engine_tp_size 等其他参数
+
+        engine_tp_size = 1      # tensor parallel 的大小，可根据需要调整
+
 
     args = Args()
 
