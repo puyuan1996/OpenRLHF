@@ -21,7 +21,8 @@ ray status
 echo "提交 Ray 作业..."
 
 
-ray job submit --address=http://127.0.0.1:8265 \
+# ray job submit --address=http://127.0.0.1:8265 \
+ray job submit --address=127.0.0.1:8265 \
   --runtime-env-json='{
     "working_dir": "/fs-computility/ai-shen/puyuan/code/OpenRLHF",
     "excludes": [

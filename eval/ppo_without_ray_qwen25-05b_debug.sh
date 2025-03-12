@@ -7,9 +7,9 @@ deepspeed --module openrlhf.cli.train_ppo \
   --logging_steps 1 \
   --eval_steps -1 \
   --micro_train_batch_size 2 \
-  --train_batch_size 4 \
+  --train_batch_size 128 \
   --micro_rollout_batch_size 4 \
-  --rollout_batch_size 8 \
+  --rollout_batch_size 1024 \
   --max_epochs 1 \
   --prompt_max_len 1024 \
   --generate_max_len 1024 \
@@ -18,10 +18,10 @@ deepspeed --module openrlhf.cli.train_ppo \
   --actor_learning_rate 5e-7 \
   --critic_learning_rate 9e-6 \
   --init_kl_coef 0.01 \
-  --prompt_data /fs-computility/ai-shen/puyuan/model/huggingface/hub/datasets--OpenRLHF--prompt-collection-v0.1/snapshots/1d3be64c51aa57fa16aa5dc70d1bfc26e9847e12 \
+  --prompt_data OpenRLHF/prompt-collection-v0.1 \
   --input_key context_messages \
   --apply_chat_template \
-  --max_samples 100 \
+  --max_samples 10000 \
   --normalize_reward \
   --adam_offload \
   --flash_attn \
@@ -31,6 +31,8 @@ deepspeed --module openrlhf.cli.train_ppo \
 # Support remote reward model (HTTP)
 # --remote_rm_url http://localhost:5000/get_reward
 
+
+  # --prompt_data /fs-computility/ai-shen/puyuan/model/huggingface/hub/datasets--OpenRLHF--prompt-collection-v0.1/snapshots/1d3be64c51aa57fa16aa5dc70d1bfc26e9847e12 \
 
   # --vllm_num_engines 1 \
   # --vllm_tensor_parallel_size 1 \
