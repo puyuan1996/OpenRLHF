@@ -54,45 +54,33 @@ def create_sub_group(group_size: int):
     return group
 
 # -------------------------------
-# 修改后的 get_sglang_engine 使用 VerlEngine 初始化推理引擎
+# vLLM 中的 get_vllm_engine 类似，这里新增 get_sglang_engine
 # -------------------------------
 def get_sglang_engine(args):
     """
-    根据参数构建 VerlEngine 引擎，并返回引擎对象以及设备网格（如有需要）。
-    通过 torch.distributed.device_mesh 初始化设备网格，避免与 Deepspeed 的分布式设置冲突。
+    根据参数构建 sglang 引擎，并返回引擎对象以及子分组（如果有需要）。
+    目前示例中直接初始化 sglang 引擎，无需额外分组，返回 None。
     """
-    from torch.distributed.device_mesh import init_device_mesh
-    from sglang.srt.entrypoints.verl_engine import VerlEngine
+    import sglang as sgl
 
-    world_size = dist.get_world_size()
-    tp_size = args.engine_tp_size
-    if world_size % tp_size != 0:
-        raise ValueError(
-            f"world_size ({world_size}) must be divisible by engine_tp_size ({tp_size})"
-        )
-    dp_size = world_size // tp_size
+    # 如有需要可以根据 args 创建 tensor parallel group：
+    # sglang_tp_group = create_sub_group(args.engine_tp_size)  # 示例：如果 args 中有该参数
 
-    device_mesh_kwargs = dict(
-        mesh_shape=(tp_size, dp_size, 1),
-        mesh_dim_names=["tp", "dp", "pp"]
-    )
-    device_mesh_cpu = init_device_mesh("cpu", **device_mesh_kwargs)
-    tp_rank = device_mesh_cpu.get_local_rank("tp")
-    dp_rank = device_mesh_cpu.get_local_rank("dp")
-    print(
-        f"rank {dist.get_rank()}: Initialize VerlEngine with tp_rank={tp_rank}, dp_rank={dp_rank}"
-    )
+    print(f'rank {dist.get_rank()}: =========debug: pos 1 =========')
 
-    verl_engine = VerlEngine(
-        model_path=args.pretrain,
-        mem_fraction_static=getattr(args, "mem_fraction_static", 0.1),
-        device_mesh_cpu=device_mesh_cpu["tp"],
-        base_gpu_id=dp_rank,
-        gpu_id_step=dp_size,
-        port=getattr(args, "port", 30000),
-    )
+    # 目前未使用额外的分组
+    # if dist.get_rank() == 0:
+    #     sglang_engine = sgl.Engine(model_path=args.pretrain, tp_size=args.engine_tp_size)
+    #     # sglang_engine = sgl.Engine(model_path=args.pretrain, distributed_executor_backend="external_launcher")
+    # else:
+    #     sglang_engine = None
+    
+    sglang_engine = sgl.Engine(model_path=args.pretrain, tp_size=args.engine_tp_size)
 
-    return verl_engine, device_mesh_cpu
+
+    print(f'rank {dist.get_rank()}: =========debug: pos 2 =========')
+
+    return sglang_engine, None
 
 # -------------------------------
 # Samples 和 BaseGenerationBackend 定义
@@ -127,20 +115,21 @@ class BaseGenerationBackend:
         raise NotImplementedError
 
 # -------------------------------
-# SGLangBackend 基于 VerlEngine 实现文本生成接口
+# SGLangBackend 基于 sglang 工具包实现文本生成接口，
+# 采用 get_sglang_engine 获取引擎并赋值给 self.engine
 # -------------------------------
 class SGLangBackend(BaseGenerationBackend):
     def __init__(self, args, tokenizer, prompt_max_len: int = 1024):
         """
-        args: 包含 VerlEngine 引擎参数的对象，其中 pretrain 为模型路径等
+        args: 包含 sglang 引擎参数的对象，其中 pretrain 为模型路径
         tokenizer: 用于 tokenization 的 tokenizer 对象
         prompt_max_len: prompt 最大长度
         """
         self.tokenizer = tokenizer
         self.prompt_max_len = prompt_max_len
-        print(f"Initializing VerlEngine with model path: {args.pretrain}")
-        # 针对所有 rank 均初始化 VerlEngine
-        self.engine, _ = get_sglang_engine(args)
+        print(f"Initializing sglang engine via get_sglang_engine with model path: {args.pretrain}")
+        if dist.get_rank() == 0:
+            self.engine, _ = get_sglang_engine(args)
     
     @torch.no_grad()
     def generate(self, prompts: List[str], labels: List[str], generate_kwargs: dict = {}) -> List[Samples]:
@@ -151,10 +140,16 @@ class SGLangBackend(BaseGenerationBackend):
         eos_token_id = self.tokenizer.eos_token_id if hasattr(self.tokenizer, "eos_token_id") else 1
 
         for prompt, label in zip(prompts, labels):
-            # 调用 VerlEngine 进行生成，此处直接传入字符串 prompt
-            generated_text = self.engine.generate(prompt=prompt, sampling_params=sampling_params)
-            # 如果返回文本为空或末尾没有 eos 标记，则进行简单补全（实际使用时请根据 tokenizer 配置处理）
+            # 调用 sglang 引擎生成，注意 sglang 的 generate 接口要求传入 prompt 列表
+            if dist.get_rank() == 0:
+                outputs = self.engine.generate([prompt], sampling_params=sampling_params)
+            # 获取 sglang 返回的第一个结果
+            output_dict = outputs[0]
+            # 从结果中获取生成文本
+            generated_text = output_dict.get("text", "")
+            # 可以检查是否存在 eos_token, 此处示例简单拼接
             if len(generated_text) == 0 or generated_text[-1] != chr(eos_token_id):
+                # 此处仅为示例，实际请根据 tokenizer 的 eos_token_id 处理
                 generated_text += chr(eos_token_id)
 
             # Tokenize prompt 和生成文本
@@ -191,7 +186,7 @@ class SGLangBackend(BaseGenerationBackend):
         return samples_list
 
 # -------------------------------
-# 示例模型：支持普通前向传播和 VerlEngine 推理模式
+# 示例模型：支持普通前向传播和 sglang 推理模式
 # -------------------------------
 class SimpleModel(nn.Module):
     def __init__(self, input_dim=10, hidden_dim=20, output_dim=1, use_sglang=False):
@@ -207,7 +202,7 @@ class SimpleModel(nn.Module):
         import torch.distributed as dist
         
         if self.use_sglang and sglang_backend is not None:
-            print(f'rank {dist.get_rank()}: =========debug: VerlEngine generation mode =========')
+            print(f'rank {dist.get_rank()}: =========debug: sglang generation mode =========')
             samples = sglang_backend.generate(prompts, labels, generate_kwargs)
             return samples[0].sequences
         elif self.use_sglang:
@@ -217,7 +212,7 @@ class SimpleModel(nn.Module):
             return self.net(x)
 
 ###############################################################################
-# 主函数，展示如何在 DeepSpeed 训练过程中使用 VerlEngine 推理以及普通训练模式
+# 主函数，展示如何在 DeepSpeed 训练过程中使用 sglang 推理以及普通训练模式
 ###############################################################################
 def main():
     # 模拟 DeepSpeed 的命令行参数，通常由 launcher 传入
@@ -232,14 +227,11 @@ def main():
         train_batch_size = 32
         max_norm = 1.0
 
-        # VerlEngine（原 sglang 引擎）参数：模型路径、tensor parallel 大小等
+        # sglang 引擎参数：模型路径，请确保该路径正确
         engine_tp_size = 4      # tensor parallel 的大小，可根据需要调整
         pretrain = "/fs-computility/ai-shen/puyuan/model/huggingface/hub/models--OpenRLHF--Llama-3-8b-sft-mixture/snapshots/03334dc4a796d9d72850ead46956c33da22e6d7b"
-        mem_fraction_static = 0.1
-        port = 30000
-
-        # 如有需要，也可以调整其他参数
-        # engine_tp_size = 1
+        
+        # engine_tp_size = 1      # tensor parallel 的大小，可根据需要调整
         # pretrain = "/fs-computility/ai-shen/puyuan/model/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987"
 
 
@@ -269,19 +261,19 @@ def main():
 
     print(f'rank {dist.get_rank()}: =========debug: pos 0 =========')
 
-    # 方式一：使用 VerlEngine 推理模式（生成调用，不用于梯度更新）
-    
+    # 方式一：使用 sglang 推理模式（生成调用，不用于梯度更新）
     sglang_backend = SGLangBackend(
         args=args,
         tokenizer=tokenizer,
         prompt_max_len=1024
     )
     
-    print(f'rank {dist.get_rank()}: =========debug: starting VerlEngine generation test =========')
+    print(f'rank {dist.get_rank()}: =========debug: starting sglang generation test =========')
 
     model_sgl = SimpleModel(use_sglang=True)
 
     print(f'rank {dist.get_rank()}: =========debug: pos 3 =========')
+
 
     model_sgl, optimizer_sgl, scheduler_sgl = strategy.prepare(
         (
@@ -305,10 +297,10 @@ def main():
             generate_kwargs={"sampling_params": {"temperature": 0.8, "top_p": 0.95}},
             sglang_backend=sglang_backend
         )
-        print(f'rank {dist.get_rank()}: =========debug: VerlEngine generation output =========')
-        print(f"rank {dist.get_rank()}: VerlEngine 模式下生成的序列 tensor:", generated)
+        print(f'rank {dist.get_rank()}: =========debug: sglang generation output =========')
+        print(f"rank {dist.get_rank()}: sglang 模式下生成的序列 tensor:", generated)
 
-    print(f'rank {dist.get_rank()}: =========debug: VerlEngine generation test finished =========')
+    print(f'rank {dist.get_rank()}: =========debug: sglang generation test finished =========')
 
 
 if __name__ == '__main__':
