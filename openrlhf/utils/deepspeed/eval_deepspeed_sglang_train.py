@@ -233,7 +233,7 @@ def main():
         max_norm = 1.0
 
         # VerlEngine（原 sglang 引擎）参数：模型路径、tensor parallel 大小等
-        engine_tp_size = 4      # tensor parallel 的大小，可根据需要调整
+        engine_tp_size = 1      # tensor parallel 的大小，可根据需要调整
         pretrain = "/fs-computility/ai-shen/puyuan/model/huggingface/hub/models--OpenRLHF--Llama-3-8b-sft-mixture/snapshots/03334dc4a796d9d72850ead46956c33da22e6d7b"
         mem_fraction_static = 0.1
         port = 30000
@@ -270,7 +270,6 @@ def main():
     print(f'rank {dist.get_rank()}: =========debug: pos 0 =========')
 
     # 方式一：使用 VerlEngine 推理模式（生成调用，不用于梯度更新）
-    
     sglang_backend = SGLangBackend(
         args=args,
         tokenizer=tokenizer,
