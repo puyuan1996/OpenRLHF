@@ -1,0 +1,15 @@
+Performance Analysis Report
+=============================
+Number of iterations: 10
+
+Average Response Time: 1.2393 seconds
+Response Time Standard Deviation: 0.0039 seconds
+
+Average Throughput: 110.39 tokens/second
+Average Per-token Time: 9.06 ms
+
+Max GPU Memory Allocated during inference: 0.01 MB
+
+Raw durations per iteration (s): 1.2376, 1.2369, 1.2368, 1.2384, 1.2402, 1.2388, 1.2505, 1.2379, 1.2366, 1.2389
+Raw throughputs per iteration (tokens/s): 110.70, 110.76, 110.77, 110.62, 110.47, 110.59, 109.56, 110.67, 109.17, 110.59
+Raw per-token times per iteration (ms): 9.03, 9.03, 9.03, 9.04, 9.05, 9.04, 9.13, 9.04, 9.16, 9.04
