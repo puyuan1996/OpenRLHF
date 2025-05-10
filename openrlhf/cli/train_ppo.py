@@ -18,6 +18,9 @@ def train(args):
     strategy = get_strategy(args)
     strategy.setup_distributed()
 
+    # if strategy.is_rank_0():
+    #     import ipdb; ipdb.set_trace()
+    
     # configure model
     # load huggingface model
     actor = Actor(
@@ -267,6 +270,7 @@ def train(args):
         remote_rm_url=args.remote_rm_url,
         save_hf_ckpt=args.save_hf_ckpt,
         disable_ds_ckpt=args.disable_ds_ckpt,
+        backend=args.backend,
     )
 
     trainer.fit(args, prompts_dataloader, pretrain_dataloader, consumed_samples, num_update_steps_per_episodes)
@@ -287,7 +291,14 @@ def train(args):
 
 
 if __name__ == "__main__":
+    import os
+    os.environ["MASTER_PORT"] = "29506" # TODO
+
     parser = argparse.ArgumentParser()
+
+    # Backend for inference
+    parser.add_argument("--backend", type=str, default="vllm", help="backend for inference")
+
     # Checkpoint
     parser.add_argument("--save_path", type=str, default="./ckpt")
     parser.add_argument("--save_steps", type=int, default=-1)
@@ -425,6 +436,8 @@ if __name__ == "__main__":
 
     # ModelScope parameters
     parser.add_argument("--use_ms", action="store_true", default=False)
+
+    parser.add_argument("--vllm_enable_sleep", action="store_true", default=False)
 
     args = parser.parse_args()
 

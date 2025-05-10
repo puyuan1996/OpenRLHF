@@ -1,4 +1,4 @@
-from .deepspeed import DeepspeedStrategy
+from .deepspeed_strategy import DeepspeedStrategy
 
 __all__ = [
     "DeepspeedStrategy",

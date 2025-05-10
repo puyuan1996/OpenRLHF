@@ -17,8 +17,6 @@ from openrlhf.utils.distributed_sampler import DistributedSampler
 
 from .ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveExperienceMaker, NaiveReplayBuffer
 
-from .ppo_utils.experience_maker import VLLMBackend, SGLangBackend
-
 
 class PPOTrainer(ABC):
     """
@@ -144,27 +142,6 @@ class PPOTrainer(ABC):
         else:
             self.kl_ctl = FixedKLController(init_kl_coef)
 
-        # 例如使用 vllm 后端
-        vllm_backend = VLLMBackend(
-            model_name="Qwen/Qwen2.5-0.5B",
-            # model_name="OpenRLHF/Llama-3-8b-sft-mixture",
-            tokenizer=tokenizer,
-            prompt_max_len=1024,
-            tensor_parallel_size=1, 
-            # tensor_parallel_size=7, 
-        )
-
-        # 如果希望使用 sglang 后端，则替换为：
-        # sglang_backend = SGLangBackend(
-        #     # model_path="meta-llama/Meta-Llama-3.1-8B-Instruct",
-        #     model_path="Qwen/Qwen2.5-0.5B",
-        #     tokenizer=tokenizer,
-        #     prompt_max_len=128,
-        #     # trust_remote_code=True,
-        #     tensor_parallel_size=1,
-        #     seed=42,
-        # )
-
         self.experience_maker = NaiveExperienceMaker(
             actor,
             critic,
@@ -176,8 +153,6 @@ class PPOTrainer(ABC):
             strategy,
             remote_rm_url,
             reward_fn,
-            generation_backend=vllm_backend,  # 或改为 sglang_backend
-            # generation_backend=sglang_backend,  # 或改为 sglang_backend
         )
         packing_samples = getattr(self.args, "packing_samples", False)
         self.replay_buffer = NaiveReplayBuffer(
